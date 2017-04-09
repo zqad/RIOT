@@ -227,3 +227,9 @@ ifneq (,$(filter mtd_spi_nor,$(USEMODULE)))
   USEMODULE += mtd
   FEATURES_REQUIRED += periph_spi
 endif
+
+ifneq (,$(filter onewire,$(USEMODULE)))
+    FEATURES_REQUIRED += periph_gpio
+    USEMODULE += timex
+    USEMODULE += xtimer
+endif

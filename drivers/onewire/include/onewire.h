@@ -55,8 +55,8 @@ typedef struct onewire_address {
 
 struct onewire_port {
 	gpio_t gpio;
-	uint8_t tpdh_quarters;
-        uint8_t tpdl_quarters;
+	uint16_t tpdh_quarters;
+        uint16_t tpdl_quarters;
 	uint8_t max_devices;
 	uint8_t num_devices;
 	onewire_address_t *devices;

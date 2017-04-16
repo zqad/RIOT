@@ -6,6 +6,9 @@
  * directory for more details.
  */
 
+#define ENABLE_DEBUG  (1)
+#include "debug.h"
+
 /**
  * @ingroup     drivers_onewire
  * @{
@@ -38,6 +41,7 @@
 static const char *onewire_result_strings[] = {
 	"No error",
 	"Communication Error",
+	"No devices",
 	"Too many devices",
 	"No such error",
 };
@@ -50,51 +54,74 @@ static inline void set_gpio_direction(struct onewire_port *port,
 	gpio_init(port->gpio, direction);
 }
 
-static inline void sleep_quarter_timeslot(uint8_t num_quarters)
+static inline void delay_us(uint32_t num)
+{
+	/* Spin instead of sleeping, as sleeping would mean that we get hit by
+	 * the scheduling delay which may be upwards to 100us */
+	xtimer_ticks32_t t = xtimer_ticks_from_usec(num);
+	if (t.ticks32 == 0)
+		t.ticks32 = 1;
+	xtimer_spin(t);
+}
+
+static inline void delay_quarter_timeslot(uint8_t num_quarters)
 {
 	/* One timeslot == 60us */
-	xtimer_usleep(15 * num_quarters);
+	delay_us(15 * num_quarters);
 }
 
-/* Many parts of the protocol is centered around quarter-timeslot sleeps */
-static inline void sleep_timeslots(uint8_t num_timeslots)
+static inline void delay_timeslots(uint8_t num_timeslots)
 {
-	sleep_quarter_timeslot(num_timeslots * 4);
+	delay_quarter_timeslot(num_timeslots * 4);
 }
 
-
+#include <stdio.h>
 static inline enum onewire_result reset_pulse(struct onewire_port *port)
 {
+	uint8_t limit = 0;
+
 	/* Send the reset signal */
 	set_gpio_direction(port, ONEWIRE_GPIO_OUT);
 	gpio_clear(port->gpio);
 	/* Keep the port low for "at least 8 time slots", we will do 10 */
-	sleep_timeslots(10);
+	delay_timeslots(10);
 
 	/* Time to read from the port */
 	set_gpio_direction(port, ONEWIRE_GPIO_IN);
 	/* Allow the line some time to float up */
-	sleep_quarter_timeslot(1);
+	while (!gpio_read(port->gpio)) {
+		delay_us(1);
+		/* If the line after 200us still is not up, something is wrong
+		 * with the line */
+		if (limit++ > 200)
+			return ONEWIRE_RESULT_COMM_ERROR;
+	}
 
 	/* Spin until line is low */
-	port->tpdh_quarters = 1;
+	port->tpdh_quarters = 0;
 	port->tpdl_quarters = 0;
 	do {
-		sleep_quarter_timeslot(1);
+		delay_quarter_timeslot(1);
 		port->tpdh_quarters++;
 		/* Should not exceed 1 timeslots, but allow +1/2 */
-		if (port->tpdh_quarters > 6)
-			return ONEWIRE_RESULT_COMM_ERROR;
+		if (port->tpdh_quarters > 90)
+			return ONEWIRE_RESULT_NO_DEVICES;
 	} while (gpio_read(port->gpio));
 
 	/* Spin until line is high */
 	do {
-		sleep_quarter_timeslot(1);
+		delay_quarter_timeslot(1);
 		port->tpdl_quarters++;
 		/* Should not exceed 1 timeslots, but allow +1/2 */
-		if (port->tpdl_quarters > 18)
+		if (port->tpdl_quarters > 90)
 			return ONEWIRE_RESULT_COMM_ERROR;
 	} while (!gpio_read(port->gpio));
+
+	/* Make sure that we waited at least 8 time slots after the reset
+	 * pulse ended so that all devices will be ready to recieve commands
+	 */
+	delay_quarter_timeslot(8 * 4 - port->tpdh_quarters -
+			port->tpdl_quarters);
 
 	/* Check that the tdpl period was at least one time period, allow for
 	 * -1/4 for any sampling issue */
@@ -113,23 +140,25 @@ const char *onewire_error_to_string(enum onewire_result result)
 
 static inline void write_bit(struct onewire_port *port, uint8_t value)
 {
-	/* Send a write pulse */
 	set_gpio_direction(port, ONEWIRE_GPIO_OUT);
+
+	/* Send a write pulse */
 	gpio_clear(port->gpio);
 
-	/* Sleep for t_LOW1, do 2us to make sure that the line goes up fully */
-	xtimer_usleep(2);
+	/* Sleep for t_LOW1, do one half sample to make sure that the line
+	 * goes down fully */
+	delay_us(7);
 
-	/* Write the 1 */
+	/* Pull the line up if data is 1 */
 	if (value)
 		gpio_set(port->gpio);
 
 	/* Sleep for 1+1/4 of a slot */
-	sleep_quarter_timeslot(5);
+	delay_quarter_timeslot(5);
 
-	/* Sleep for t_REC, do 5us to make sure that the line floats up */
+	/* Sleep for t_REC, do 20us to make sure that the line floats up */
 	set_gpio_direction(port, ONEWIRE_GPIO_IN);
-	xtimer_usleep(5);
+	delay_us(20);
 }
 
 static void write_octet(struct onewire_port *port, uint8_t value)
@@ -147,25 +176,25 @@ static inline enum onewire_result read_or_bit_lsb(struct onewire_port *port,
 	set_gpio_direction(port, ONEWIRE_GPIO_OUT);
 	gpio_clear(port->gpio);
 
-	/* Sleep for t_LOWR, do 2us to make sure that the line goes up fully */
-	xtimer_usleep(2);
+	/* Sleep for t_LOWR, do 7us to make sure that the line goes up fully */
+	delay_us(5);
 
 	/* Release the line, wait for the write */
 	set_gpio_direction(port, ONEWIRE_GPIO_IN);
-	xtimer_usleep(7);
+	delay_us(5);
 
 	/* Read the bit and or it to the value at the LSB position */
 	*value |= gpio_read(port->gpio) ? 1 : 0;
 
 	/* Wait out the timeslot */
-	sleep_timeslots(1);
+	delay_timeslots(1);
 
 	/* Check that the line has gone high */
 	if (!gpio_read(port->gpio))
 		return ONEWIRE_RESULT_COMM_ERROR;
 
 	/* Sleep for t_REC */
-	xtimer_usleep(1);
+	delay_us(10);
 
 	return ONEWIRE_RESULT_OK;
 }
@@ -183,10 +212,13 @@ enum onewire_result onewire_read_octet(struct onewire_port *port, uint8_t *value
 	return result;
 }
 
-void onewire_send_command(struct onewire_port *port, uint8_t cmd)
+enum onewire_result onewire_send_command(struct onewire_port *port, uint8_t cmd)
 {
-	reset_pulse(port);
+	enum onewire_result result = reset_pulse(port);
+	if (result)
+		return result;
 	write_octet(port, cmd);
+	return ONEWIRE_RESULT_OK;
 }
 
 enum onewire_result onewire_search(struct onewire_port *port)
@@ -198,6 +230,13 @@ enum onewire_result onewire_search(struct onewire_port *port)
 	uint8_t last_split_position = -1;
 	uint8_t next_bit;
 	uint8_t device_position = 0;
+
+	/* Think of the search space as a binary tree, where each address is
+	 * layed out with the first transferred bit at the level below the
+	 * root, and the second bit following. The addresses of the nodes on
+	 * the bus may then be described as paths starting at the root and
+	 * ending up in a leaf.
+	 */
 
 	do {
 		/* Initialize current_split_position, so it may be used to
@@ -211,10 +250,9 @@ enum onewire_result onewire_search(struct onewire_port *port)
 		}
 
 		/* Send reset and search command */
-		result = reset_pulse(port);
+		result = onewire_send_command(port, ONEWIRE_NL_CMD_SEARCH_ROM);
 		if (result)
 			return result;
-		onewire_send_command(port, ONEWIRE_NL_CMD_SEARCH_ROM);
 
 		for (uint8_t position = 0; position < 64; position++) {
 			/* Read address bit */
